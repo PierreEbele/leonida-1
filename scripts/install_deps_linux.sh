@@ -57,6 +57,13 @@ ID=${ID:-unknown}
 ID_LIKE=${ID_LIKE:-}
 is_like() { case " $ID $ID_LIKE " in *" $1 "*) return 0 ;; esac; return 1; }
 
+confirm() {
+    local answer
+    [ "$assume_yes" -eq 1 ] && return 0
+    read -r -p "$1 [y/N] " answer || return 1
+    case "$answer" in y|Y|yes|o|O|oui) return 0 ;; *) return 1 ;; esac
+}
+
 apt_has() { apt-cache show "$1" >/dev/null 2>&1; }
 
 setup_apt() {
@@ -66,8 +73,12 @@ setup_apt() {
         if [ "$dry_run" -eq 1 ]; then
             die "apt has no package lists yet; run '${SU}apt-get update' first"
         fi
+        say "Package lists are needed to choose an LLVM version: ${SU}apt-get update"
+        confirm "Refresh the package lists now?" || { say "Nothing installed."; exit 1; }
         say "+ ${SU}apt-get update"
         "${SUDO[@]}" apt-get update
+    else
+        plan "${SU}apt-get update"
     fi
     for v in "${LLVM_TRY[@]}"; do
         if apt_has "llvm-$v"; then llvm=$v; break; fi
@@ -84,7 +95,6 @@ setup_apt() {
         else warn ".NET SDK isn't packaged here; the assets stage needs it: https://learn.microsoft.com/dotnet/core/install/linux"
         fi
     fi
-    plan "${SU}apt-get update"
     plan "${SU}apt-get install -y ${pkgs[*]} ${optional[*]}"
 }
 
@@ -126,10 +136,7 @@ for c in "${PLAN[@]}"; do say "  $c"; done
 say ""
 [ "$dry_run" -eq 1 ] && exit 0
 
-if [ "$assume_yes" -eq 0 ]; then
-    read -r -p "Run them? [y/N] " answer
-    case "$answer" in y|Y|yes|o|O|oui) ;; *) say "Nothing installed."; exit 1 ;; esac
-fi
+confirm "Run them?" || { say "Nothing installed."; exit 1; }
 for c in "${PLAN[@]}"; do
     say "+ $c"
     bash -c "$c"
