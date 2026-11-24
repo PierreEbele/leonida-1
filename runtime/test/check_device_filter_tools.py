@@ -7,10 +7,12 @@ ignored the filter and ran on the best-ranked GPU.
     python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir>
 
 Exit 0 when both tools refuse the filter, 1 when one does not or when the device list fails for another reason, and
-77 (skip) on a machine with no Vulkan loader, driver or device, where no tool can choose one. Standard library only.
+77 (skip) on a machine with no Vulkan loader, driver or device, where no tool can choose one, or with no wine to
+run the cross-compiled tools at all (the Windows build of this tree on Linux). Standard library only.
 """
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -19,8 +21,31 @@ FILTER = "leonida-no-such-gpu"
 UNSUPPORTED = 77
 
 
+def is_pe(path):
+    """True when `path` is a PE executable (its MZ header)."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def launch_runner(path):
+    """The argv that starts the harness at `path`: ["wine"] for a PE executable on a host that cannot run one,
+    [] to run it as-is. The Windows tree of this repo is cross-compiled on Linux (docs/testing.md), so the tools
+    this checker is pointed at are PE executables there; they go through the wine that runs the suite, the same
+    WINE override scripts/run_wine_tests.py takes, else the wine on PATH."""
+    if os.name == "nt" or not is_pe(path):
+        return []
+    wine = os.environ.get("WINE") or shutil.which("wine")
+    return [wine] if wine else []
+
+
 def run(cmd, env=None):
-    p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=120)
+    p = subprocess.run(launch_runner(cmd[0]) + cmd, capture_output=True, text=True, errors="replace", env=env,
+                       timeout=120)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -43,6 +68,11 @@ def main(argv):
         return 2
     bench, sandbox, work = argv[1:]
     os.makedirs(work, exist_ok=True)
+    # The cross build's tools cannot run at all without wine: the machine cannot judge them, as when it has no
+    # Vulkan device.
+    if os.name != "nt" and is_pe(bench) and not launch_runner(bench):
+        print(f"SKIP: {bench} is a PE executable and no wine (WINE or PATH) was found to run it")
+        return UNSUPPORTED
 
     # The device list ignores the filter, so it shows whether there is any device to choose from.
     plain = {k: v for k, v in os.environ.items() if k != "LEONIDA_VK_DEVICE"}
