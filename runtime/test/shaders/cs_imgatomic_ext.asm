@@ -56,10 +56,10 @@ s_mov_b32 s8, 0x5000
 s_mov_b32 s9, 0x1400000
 s_mov_b32 s10, 0x55
 s_mov_b32 s11, 0x55
-s_mov_b32 s12, 0x55
+s_mov_b32 s12, 0x80000055
 s_mov_b32 s13, 0x55
 s_mov_b32 s14, 0x55
-s_mov_b32 s15, 0x55
+s_mov_b32 s15, 0xd7801800
 s_mov_b32 s16, 0x2000
 s_mov_b32 s17, 0x1400000
 s_mov_b32 s18, 0x22
