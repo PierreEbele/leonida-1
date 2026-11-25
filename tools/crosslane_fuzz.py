@@ -1305,23 +1305,34 @@ def resolve_branches(cmd, prog, src):
     return "\n".join(branch_offsets(lines, dict(zip(insns, sizes)))) + "\n"
 
 
-def translate(work, emulate):
+def pc_tail_env():
+    """True when LEONIDA_PC_TAIL_UBO asks for rdna2spirv.py --pc-tail-ubo (128-byte push constants)."""
+    return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def translate(work, emulate, pc_tail=False):
     out = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
     cmd = [sys.executable, "-I", TRANSLATOR[0], os.path.join(work, "disasm"), "--out", out]
     if emulate:
         cmd.append("--wave64-emulate")
+    if pc_tail:
+        cmd.append("--pc-tail-ubo")
     r = subprocess.run(cmd, capture_output=True, text=True)
     return out, r.stdout + r.stderr
 
 
-def gpu_env(prog, emulate, dump, base=None):
+def gpu_env(prog, emulate, dump, base=None, pc_tail=False):
     """vk_compute_test's environment (FUZZ-6, tools/lds_fuzz.py): VKC_OUT_WORDS sizes the buffer, VKC_DUMP gets its
     raw bytes. A wave32 program, or a wave64 one translated with --wave64-emulate, is written for 32-wide subgroups,
     so it asks for them with VKC_SUBGROUP_SIZE=32, as lds_fuzz.py and valu_fuzz.py do (FUZZ-13): on AMD, whose
     compute default is 64, a group over 32 would otherwise run as one 64-wide subgroup and mismatch in wave 1.
-    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has)."""
+    A native wave64 program keeps the device default (--w64-native runs it on whatever the GPU has). With pc_tail
+    it also gets LEONIDA_PC_TAIL_UBO=1, for a translation with --pc-tail-ubo (D3D-14), as lds_fuzz.py and
+    valu_fuzz.py do."""
     env = dict(os.environ if base is None else base, VKC_OUT_WORDS=str(max(prog.group * len(OUT_REGS), 64)),
                VKC_DUMP=dump)
+    if pc_tail:
+        env["LEONIDA_PC_TAIL_UBO"] = "1"
     if prog.wave == 32 or emulate:
         env["VKC_SUBGROUP_SIZE"] = "32"
     return env
@@ -1340,11 +1351,11 @@ class Unpinned(RuntimeError):
 GPU_TIMEOUT = 60    # seconds for one program; a translated program that never ends shows up as this
 
 
-def run_gpu(exe, spv, prog, work, emulate):
+def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
     dump = os.path.join(work, "dump.bin")
     if os.path.exists(dump):
         os.remove(dump)                 # never compare a stale dump
-    env = gpu_env(prog, emulate, dump)
+    env = gpu_env(prog, emulate, dump, pc_tail=pc_tail)
     try:
         r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -1396,7 +1407,7 @@ def minimize(prog, mode, ctx):
 
 
 def still_fails(prog, ops, mode, ctx):
-    mc, exe = ctx
+    mc, exe, pc_tail = ctx
     with tempfile.TemporaryDirectory(prefix="xlmin-") as work:
         for d in ("disasm", "fssm"):
             os.mkdir(os.path.join(work, d))
@@ -1404,12 +1415,12 @@ def still_fails(prog, ops, mode, ctx):
             assemble(mc, prog, prog.source(ops), os.path.join(work, "disasm"), os.path.join(work, "fssm"))
         except RuntimeError:
             return False
-        spdir, _ = translate(work, mode == "emulate")
+        spdir, _ = translate(work, mode == "emulate", pc_tail)
         spv = os.path.join(spdir, prog.name + ".spv")
         if not os.path.exists(spv):
             return False
         try:
-            bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
+            bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate", pc_tail), ops)
         except (HarnessError, Unpinned):
             return False                # a reduction that hangs or crashes is not the mismatch being reduced
         return bool(bad) and not hyp
@@ -1456,6 +1467,9 @@ def main():
     ap.add_argument("--w64-native", action="store_true",
                     help="also run wave64 programs without --wave64-emulate (on a 32-wide subgroup that is the "
                          "documented cross-half approximation, so mismatches are expected there)")
+    ap.add_argument("--pc-tail-ubo", action="store_true",
+                    help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
+                         "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--no-maskdata", action="store_true", help="leave out masks read as data (#293)")
     ap.add_argument("--no-w32-hi-lanes", action="store_true", help="wave32 lane selects stay below 32")
     ap.add_argument("--exe", default=os.path.join(ROOT, "runtime", "build", "vk_compute_test" +
@@ -1482,6 +1496,7 @@ def main():
     ap.add_argument("--translator", help="rdna2spirv.py to test (default: the one next to this file)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    args.pc_tail_ubo = args.pc_tail_ubo or pc_tail_env()
     if not os.path.isfile(args.exe):   # a Visual Studio build puts it in a configuration subfolder
         folder, name = os.path.split(args.exe)
         for config in ("RelWithDebInfo", "Release"):
@@ -1568,7 +1583,7 @@ def main():
                 if mode == "hw":
                     ops = minimize_hw(p, oracle, not args.no_hw_guard)
                 elif mc is not None:
-                    ops = minimize(p, mode, (mc, args.exe))
+                    ops = minimize(p, mode, (mc, args.exe, args.pc_tail_ubo))
                 else:
                     continue
                 hyp_ops = p.expected(ops)[1]
@@ -1675,6 +1690,7 @@ def minimize_hw(prog, oracle, guard=True):
 
 
 def run_translator(args, mc, progs, waves, modes, stats, fails):
+    pc_tail = bool(getattr(args, "pc_tail_ubo", False))
     with tempfile.TemporaryDirectory(prefix="crosslane-") as work:
         disasm, fssm = os.path.join(work, "disasm"), os.path.join(work, "fssm")
         os.mkdir(disasm)
@@ -1684,7 +1700,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
         for mode in modes:
             if mode == "emulate" and 64 not in waves:
                 continue
-            spdir, log = translate(work, mode == "emulate")
+            spdir, log = translate(work, mode == "emulate", pc_tail)
             for p in progs:
                 if mode == "emulate" and p.wave != 64:
                     continue
@@ -1700,7 +1716,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     fails.append((p, mode, "not translated", None))
                     continue
                 try:
-                    bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
+                    bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate", pc_tail))
                 except HarnessError as e:
                     # One program that hangs or crashes the harness used to end the run with a traceback and
                     # lose every result before it. It is reported like the other failures and the run goes on.
